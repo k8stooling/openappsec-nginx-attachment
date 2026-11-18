@@ -1,0 +1,107 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      nginx_version:
+        description: 'Target NGINX version (e.g. 1.31.8)'
+        type: string
+        required: true
+        default: '1.31.8'
+      attachment_ref:
+        description: 'Git ref/tag of openappsec/attachment'
+        type: string
+        required: false
+        default: 'main'
+      debian_suite:
+        description: 'Base Debian suite matching target NGINX runtime'
+        type: choice
+        default: 'trixie-slim'
+        options: ['trixie-slim', 'bookworm-slim']
+      platforms:
+        description: 'Target platforms (comma separated)'
+        type: string
+        required: false
+        default: 'linux/amd64'
+      push_image:
+        description: 'Push built initContainer image to GHCR'
+        type: boolean
+        required: false
+        default: true
+  pull_request:
+    paths: ['Dockerfile', '.github/workflows/build.yml']
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  NGINX_VERSION: ${{ inputs.nginx_version || '1.31.8' }}
+  ATTACHMENT_REF: ${{ inputs.attachment_ref || 'main' }}
+  DEBIAN_SUITE: ${{ inputs.debian_suite || 'trixie-slim' }}
+  PLATFORMS: ${{ inputs.platforms || 'linux/amd64' }}
+  PUSH: ${{ github.event_name == 'workflow_dispatch' && inputs.push_image }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        if: contains(env.PLATFORMS, 'arm64')
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: env.PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: meta
+        run: |
+          img=ghcr.io/${GITHUB_REPOSITORY,,}
+          ref_tag=$(echo "$ATTACHMENT_REF" | tr '/' '-')
+          {
+            echo 'tags<<EOF'
+            echo "$img:nginx-${NGINX_VERSION}"
+            echo "$img:nginx-${NGINX_VERSION}-${ref_tag}"
+            echo "$img:nginx-${NGINX_VERSION}-${GITHUB_RUN_NUMBER}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build (and push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          push: ${{ env.PUSH == 'true' }}
+          load: ${{ env.PUSH != 'true' && !contains(env.PLATFORMS, ',') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            NGINX_VERSION=${{ env.NGINX_VERSION }}
+            OPENAPPSEC_ATTACHMENT_REF=${{ env.ATTACHMENT_REF }}
+            BASE_IMAGE=debian:${{ env.DEBIAN_SUITE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Export .so bundle
+        run: |
+          docker buildx build --target runtime \
+            --build-arg NGINX_VERSION="$NGINX_VERSION" \
+            --build-arg OPENAPPSEC_ATTACHMENT_REF="$ATTACHMENT_REF" \
+            --build-arg BASE_IMAGE="debian:$DEBIAN_SUITE" \
+            --cache-from type=gha \
+            --output type=local,dest=bundle .
+          mkdir -p dist && cp bundle/openappsec/lib/*.so dist/
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openappsec-nginx-${{ env.NGINX_VERSION }}
+          path: dist/*.so
+          if-no-files-found: error
